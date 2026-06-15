@@ -164,17 +164,6 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 
 def load_config():
     """加载 config.json 配置文件，缺失必填字段时抛出异常"""
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        print(f"错误：未找到配置文件 {CONFIG_FILE}")
-        print("请在同目录下创建 config.json 文件，内容参考示例。")
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        print(f"错误：配置文件格式不正确 - {e}")
-        sys.exit(1)
-
     defaults = {
         "USE_GLOBAL_MODE": True,
         "GLOBAL_TOP_N": 15,
@@ -276,6 +265,17 @@ def load_config():
         "IP_TXT_SHOW_HTTP_JITTER": False,
         "IP_TXT_SHOW_LATENCY": False,
     }
+
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"未找到配置文件 {CONFIG_FILE}，将使用内置默认配置运行。")
+        print(f"你可根据需要创建 config.json 文件（参考文档），程序会自动识别。")
+        return defaults
+    except json.JSONDecodeError as e:
+        print(f"错误：配置文件格式不正确 - {e}")
+        sys.exit(1)
 
     for key, value in defaults.items():
         if key not in config:
@@ -588,6 +588,12 @@ def _parse_text_nodes(text):
 
     tokens = text.split()
     for token in tokens:
+        # 尝试匹配纯 IP:端口 格式（不带 #）
+        pure_match = re.match(r'^(\d+\.\d+\.\d+\.\d+:\d+)$', token)
+        if pure_match:
+            pending.append(pure_match.group(1))
+            continue
+
         if '#' not in token:
             continue
         try:
@@ -609,7 +615,7 @@ def _parse_text_nodes(text):
             pending.append(ipport)
 
     if pending:
-        print(f"{len(pending)} 个标签未能识别，通过可用性检测 API 查询国家...")
+        print(f"{len(pending)} 个节点未能识别或缺少国家，通过可用性检测 API 查询国家...")
         resolved = _resolve_countries_batch(pending)
         for ipport, code in resolved.items():
             if code:
@@ -640,7 +646,8 @@ def fetch_additional_source(url):
     for attempt in range(1, FETCH_MAX_RETRIES + 1):
         try:
             print(f"正在请求数据源 {url} (尝试 {attempt}/{FETCH_MAX_RETRIES}) ...")
-            resp = requests.get(url, timeout=(FETCH_CONNECT_TIMEOUT, FETCH_TIMEOUT))
+            headers = {"Accept-Encoding": "gzip, deflate, br, zstd"}
+            resp = requests.get(url, timeout=(FETCH_CONNECT_TIMEOUT, FETCH_TIMEOUT), headers=headers)
             resp.raise_for_status()
             nodes = parse_adaptive(resp.text)
             print(f"从 {url} 解析出 {len(nodes)} 个节点。")
@@ -965,6 +972,27 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
         print(f"不支持的 DNS_RECORD_TYPE: {record_type}，已跳过 DNS 更新。")
         return
 
+    # ========== 新增：并发查询风险等级 ==========
+    risk_map = {}
+    if DNS_IP_RISK_FILTER_ENABLED and full_bw_results:
+        ip_set = set()
+        for node_str, _ in full_bw_results:
+            if ':' in node_str:
+                ip_set.add(node_str.split(':')[0])
+        if ip_set:
+            workers = min(FALLBACK_WORKERS, len(ip_set))
+            print(f"正在并发查询 {len(ip_set)} 个 IP 的风险等级（并发 {workers}）...")
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(get_ip_risk_level, ip): ip for ip in ip_set}
+                for future in as_completed(futures):
+                    ip = futures[future]
+                    try:
+                        risk_map[ip] = future.result()
+                    except Exception:
+                        risk_map[ip] = "未知"
+            print("风险等级查询完成。")
+    # ==========================================
+
     if full_bw_results and ip_info:
         blocked_set = set()
         if FILTER_BLOCKED_COUNTRIES_ENABLED:
@@ -1000,7 +1028,8 @@ def batch_update_cloudflare_dns(ip_list, ip_info=None, full_bw_results=None, tar
                 risk_fallback_node_list.append(node_str)
 
             if DNS_IP_RISK_FILTER_ENABLED:
-                risk_level = get_ip_risk_level(pure_ip)
+                # 从并发查询的映射中获取，不再串行等待
+                risk_level = risk_map.get(pure_ip, "未知")
                 max_level = DNS_IP_RISK_MAX_LEVEL
                 if risk_level == "未知" or RISK_LEVEL_ORDER.get(risk_level, 99) > RISK_LEVEL_ORDER.get(max_level, 2):
                     filtered_by_risk += 1
@@ -1415,6 +1444,7 @@ def main():
             content=f"带宽测速经 {BANDWIDTH_RETRY_MAX} 轮尝试后仍无有效结果，已降级使用 TCP 排序节点。",
             summary="带宽测速全部失败"
         )
+        speed_map = {}
         if USE_GLOBAL_MODE:
             final_selected = [node for node, _, _, _ in results[:GLOBAL_TOP_N]]
         else:
